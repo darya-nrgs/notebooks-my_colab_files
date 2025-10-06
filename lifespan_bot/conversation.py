@@ -10,6 +10,7 @@ from rich.prompt import Prompt
 from .api_client import BinjieClient
 from .prompts import SYSTEM_PROMPT_FA
 from .schemas import AssistantResponse, AssistantQuestion, AssistantFinal
+from .fallback import RuleBasedFallback
 
 
 class LifespanConversation:
@@ -18,6 +19,7 @@ class LifespanConversation:
         self.user_id = user_id or f"lifespan-cli-{uuid.uuid4().hex[:8]}"
         self.console = Console()
         self.qa_history: List[Dict[str, str]] = []
+        self.fallback = RuleBasedFallback()
 
     def _compose_user_prompt(self) -> str:
         state_lines = [
@@ -46,38 +48,53 @@ class LifespanConversation:
         message = self._compose_user_prompt()
         # Always include the system prompt and discourage context carry-over by asking
         # for stateless behavior on the server side as much as possible.
-        raw = self.client.generate(
-            message,
-            system=SYSTEM_PROMPT_FA,
-            user_id=self.user_id,
-            network=True,
-            without_context=True,
-            stream=False,
-        )
-        data = self.client.try_extract_json(raw)
-        if data is None:
-            # Attempt a repair call by reminding JSON-only rule
-            raw2 = self.client.generate(
-                "فقط یک JSON معتبر طبق قالب خواسته‌شده برگردان. هیچ متن اضافی چاپ نکن.",
+        try:
+            raw = self.client.generate(
+                message,
                 system=SYSTEM_PROMPT_FA,
                 user_id=self.user_id,
                 network=True,
                 without_context=True,
                 stream=False,
             )
-            data = self.client.try_extract_json(raw2)
-        if data is None:
-            raise ValueError("مدل خروجی JSON معتبر نداد. لطفاً دوباره اجرا کنید.")
+            data = self.client.try_extract_json(raw)
+            if data is None:
+                # Attempt a repair call by reminding JSON-only rule
+                raw2 = self.client.generate(
+                    "فقط یک JSON معتبر طبق قالب خواسته‌شده برگردان. هیچ متن اضافی چاپ نکن.",
+                    system=SYSTEM_PROMPT_FA,
+                    user_id=self.user_id,
+                    network=True,
+                    without_context=True,
+                    stream=False,
+                )
+                data = self.client.try_extract_json(raw2)
+        except Exception:
+            data = None
+        if data is None or not isinstance(data, dict):
+            # Fall back to local rule-based planner
+            return self.fallback.next()
 
-        # Validate against schema union
+        # Validate against schema union; if kind missing, attempt gentle coercion
+        kind = data.get("kind")
         try:
-            # pydantic v2 supports validate_python on unions via direct call
-            if data.get("kind") == "question":
+            if kind == "question":
                 return AssistantQuestion.model_validate(data)
-            else:
+            if kind == "final":
                 return AssistantFinal.model_validate(data)
-        except Exception as exc:
-            raise ValueError(f"JSON نامعتبر: {exc}")
+        except Exception:
+            # If validation fails, try coercion below
+            pass
+
+        # Coercion: if there is a 'question' field, wrap as question
+        if isinstance(data.get("question"), str):
+            try:
+                return AssistantQuestion(kind="question", question=data["question"], choices=data.get("choices"))
+            except Exception:
+                return self.fallback.next()
+
+        # Otherwise, fall back
+        return self.fallback.next()
 
     def run_cli(self) -> None:
         self.console.print("[bold green]شروع مصاحبه تخمین طول‌عمر[/bold green]")
@@ -96,6 +113,8 @@ class LifespanConversation:
                 answer = Prompt.ask("پاسخ شما")
                 # Record into history for stateful prompting
                 self.qa_history.append({"question": response.question, "answer": answer})
+                # Feed fallback too, for continuity if we switch
+                self.fallback.ingest(answer)
                 # Send only the user's answer; server maintains context via userId
                 response = self._call_model()
                 continue
